@@ -1,0 +1,29 @@
+# Portable environment for DockingScoring.ipynb (macOS and Linux).
+# For the exact versions this was developed and tested with on macOS arm64,
+# use docking_scoring.yml instead.
+name: docking_scoring
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - rdkit>=2025.03
+  - pytorch>=2.6          # from conda-forge, not pip: the pip wheel's OpenMP clashes with conda's
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - matplotlib
+  - networkx
+  - tqdm
+  - biopandas
+  - qcelemental
+  - pymol-open-source
+  - openbabel
+  - py3dmol
+  - ipywidgets
+  - jupyterlab
+  - ipykernel
+  - pip
+  - pip:
+      - torch_geometric>=2.6
+      - torchani>=2.9

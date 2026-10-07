@@ -1,0 +1,104 @@
+HEADER    HYDROLASE/HYDROLASE INHIBITOR                       5RHD    
+REMARK  99                                                                      
+REMARK  99 MOE v2024.06 (Chemical Computing Group ULC) Mon May 11 20:32:29 2026 
+REMARK  99                                                                      
+HETATM    1  N1  LIG A 408     -28.140   3.661  26.161  1.00 28.36           N1+
+ANISOU    1  N1  LIG A 408     1480   4709   4587   2378   2726   3827       N1+
+HETATM    2  C4  LIG A 408     -24.644   4.600  28.353  1.00 29.62           C  
+ANISOU    2  C4  LIG A 408     2414   4570   4271   2458   2795   3141       C  
+HETATM    3  C5  LIG A 408     -24.585   5.746  29.139  1.00 30.26           C  
+ANISOU    3  C5  LIG A 408     2681   4568   4248   2634   2979   3100       C  
+HETATM    4  C6  LIG A 408     -23.447   6.054  29.860  1.00 30.17           C  
+ANISOU    4  C6  LIG A 408     2926   4458   4079   2642   2983   2889       C  
+HETATM    5  C7  LIG A 408     -26.175   2.935  27.398  1.00 28.60           C  
+ANISOU    5  C7  LIG A 408     1849   4627   4391   2305   2656   3459       C  
+HETATM    6  C8  LIG A 408     -26.949   2.795  26.111  1.00 28.33           C  
+ANISOU    6  C8  LIG A 408     1585   4672   4508   2215   2551   3614       C  
+HETATM    7  C10 LIG A 408     -26.926   5.246  27.598  1.00 28.57           C  
+ANISOU    7  C10 LIG A 408     1941   4555   4359   2605   2956   3552       C  
+HETATM    8  O1  LIG A 408     -20.372   6.910  29.929  1.00 30.19           O1-
+ANISOU    8  O1  LIG A 408     3408   4254   3809   2492   2779   2363       O1-
+HETATM    9  S   LIG A 408     -20.834   5.707  30.563  1.00 30.60           S2+
+ANISOU    9  S   LIG A 408     3355   4375   3896   2473   2787   2459       S2+
+HETATM   10  O   LIG A 408     -19.956   4.573  30.584  1.00 30.05           O1-
+ANISOU   10  O   LIG A 408     3286   4322   3810   2314   2619   2348       O1-
+HETATM   11  C   LIG A 408     -21.294   6.088  32.212  1.00 30.50           C  
+ANISOU   11  C   LIG A 408     3506   4313   3770   2672   3024   2514       C  
+HETATM   12  C1  LIG A 408     -22.347   5.218  29.787  1.00 30.23           C  
+ANISOU   12  C1  LIG A 408     2992   4454   4040   2479   2805   2722       C  
+HETATM   13  C3  LIG A 408     -23.538   3.749  28.327  1.00 29.78           C  
+ANISOU   13  C3  LIG A 408     2509   4571   4235   2303   2628   2964       C  
+HETATM   14  C2  LIG A 408     -22.393   4.052  29.041  1.00 30.07           C  
+ANISOU   14  C2  LIG A 408     2788   4515   4123   2316   2635   2759       C  
+HETATM   15  N   LIG A 408     -25.774   4.333  27.570  1.00 28.85           N  
+ANISOU   15  N   LIG A 408     2063   4569   4330   2435   2775   3356       N  
+HETATM   16  C9  LIG A 408     -27.770   5.080  26.350  1.00 28.52           C  
+ANISOU   16  C9  LIG A 408     1681   4639   4516   2523   2859   3726       C  
+HETATM   17  H1  LIG A 408     -28.726   3.369  26.930  1.00 28.36           H  
+ANISOU   17  H1  LIG A 408     1480   4709   4587   2378   2726   3827       H  
+HETATM   18  H2  LIG A 408     -28.651   3.567  25.295  1.00 28.36           H  
+ANISOU   18  H2  LIG A 408     1480   4709   4587   2378   2726   3827       H  
+HETATM   19  H3  LIG A 408     -25.440   6.404  29.186  1.00 30.26           H  
+ANISOU   19  H3  LIG A 408     2681   4568   4248   2634   2979   3100       H  
+HETATM   20  H4  LIG A 408     -23.417   6.941  30.476  1.00 30.17           H  
+ANISOU   20  H4  LIG A 408     2926   4458   4079   2642   2983   2889       H  
+HETATM   21  H5  LIG A 408     -25.288   2.303  27.360  1.00 28.60           H  
+ANISOU   21  H5  LIG A 408     1849   4627   4391   2305   2656   3459       H  
+HETATM   22  H6  LIG A 408     -26.802   2.630  28.236  1.00 28.60           H  
+ANISOU   22  H6  LIG A 408     1849   4627   4391   2305   2656   3459       H  
+HETATM   23  H7  LIG A 408     -26.318   3.092  25.273  1.00 28.33           H  
+ANISOU   23  H7  LIG A 408     1585   4672   4508   2215   2551   3614       H  
+HETATM   24  H8  LIG A 408     -27.258   1.758  25.983  1.00 28.33           H  
+ANISOU   24  H8  LIG A 408     1585   4672   4508   2215   2551   3614       H  
+HETATM   25  H9  LIG A 408     -26.567   6.274  27.653  1.00 28.57           H  
+ANISOU   25  H9  LIG A 408     1941   4555   4359   2605   2956   3552       H  
+HETATM   26  H10 LIG A 408     -27.536   5.026  28.474  1.00 28.57           H  
+ANISOU   26  H10 LIG A 408     1941   4555   4359   2605   2956   3552       H  
+HETATM   27  H11 LIG A 408     -20.413   6.403  32.771  1.00 30.50           H  
+ANISOU   27  H11 LIG A 408     3506   4313   3770   2672   3024   2514       H  
+HETATM   28  H12 LIG A 408     -21.726   5.205  32.682  1.00 30.50           H  
+ANISOU   28  H12 LIG A 408     3506   4313   3770   2672   3024   2514       H  
+HETATM   29  H13 LIG A 408     -22.029   6.893  32.207  1.00 30.50           H  
+ANISOU   29  H13 LIG A 408     3506   4313   3770   2672   3024   2514       H  
+HETATM   30  H14 LIG A 408     -23.577   2.842  27.742  1.00 29.78           H  
+ANISOU   30  H14 LIG A 408     2509   4571   4235   2303   2628   2964       H  
+HETATM   31  H15 LIG A 408     -21.543   3.386  29.017  1.00 30.07           H  
+ANISOU   31  H15 LIG A 408     2788   4515   4123   2316   2635   2759       H  
+HETATM   32  H16 LIG A 408     -28.677   5.677  26.448  1.00 28.52           H  
+ANISOU   32  H16 LIG A 408     1681   4639   4516   2523   2859   3726       H  
+HETATM   33  H17 LIG A 408     -27.202   5.421  25.485  1.00 28.52           H  
+ANISOU   33  H17 LIG A 408     1681   4639   4516   2523   2859   3726       H  
+CONECT    1    6   16   17   18
+CONECT    2    3   13   13   15
+CONECT    3    2    4    4   19
+CONECT    4    3    3   12   20
+CONECT    5    6   15   21   22
+CONECT    6    1    5   23   24
+CONECT    7   15   16   25   26
+CONECT    8    9
+CONECT    9    8   10   11   12
+CONECT   10    9
+CONECT   11    9   27   28   29
+CONECT   12    4    9   14   14
+CONECT   13    2    2   14   30
+CONECT   14   12   12   13   31
+CONECT   15    2    5    7
+CONECT   16    1    7   32   33
+CONECT   17    1
+CONECT   18    1
+CONECT   19    3
+CONECT   20    4
+CONECT   21    5
+CONECT   22    5
+CONECT   23    6
+CONECT   24    6
+CONECT   25    7
+CONECT   26    7
+CONECT   27   11
+CONECT   28   11
+CONECT   29   11
+CONECT   30   13
+CONECT   31   14
+CONECT   32   16
+CONECT   33   16
+END
