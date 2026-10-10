@@ -67,6 +67,7 @@ dependencies:
   - freetype-py=2.3.0
   - fribidi=1.0.17
   - fsspec=2026.9.0
+  - gemmi=0.7.5
   - glew=2.3.0
   - glib=2.90.0
   - glib-tools=2.90.0

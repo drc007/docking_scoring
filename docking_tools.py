@@ -543,33 +543,404 @@ class ConformerPanel:
 
 
 # --------------------------------------------------------------------------
+# Ionisation states with QupKake (micro-pKa prediction, GFN2-xTB + GNN)
+# --------------------------------------------------------------------------
+# QupKake (Abarbanel & Hutchison, JCTC 2024) runs in its own conda env
+# ("qupkake", Python 3.9, xtb 6.4.1 built from source). It predicts micro-pKa
+# values for the sites of the NEUTRAL molecule: "basic" = pKa of the
+# conjugate acid of a site, "acidic" = deprotonation of a site.
+QUPKAKE_ENV = "qupkake"
+
+# Basic sites QupKake sometimes reports that are not basic in reality
+# (seen for this ligand series): sulphonamide N, amide/imide N, and amine N
+# bonded to an aromatic ring (aryl amines, pKa ~3-5).
+IMPLAUSIBLE_BASIC_SMARTS = {
+    "sulphonamide N": "[NX3][SX4](=O)=O",
+    "amide/imide N": "[NX3][CX3]=[OX1,SX1]",
+    "aryl-amine N": "[NX3;!a;!$(N=*)][a]",
+}
+
+
+def _conda_base():
+    exe = os.environ.get("CONDA_EXE")
+    if exe:
+        return Path(exe).resolve().parent.parent
+    for c in (Path.home() / "miniconda3", Path.home() / "anaconda3", Path.home() / "miniforge3",
+              Path("/opt/miniconda3"), Path("/opt/homebrew/Caskroom/miniforge/base")):
+        if (c / "etc" / "profile.d" / "conda.sh").exists():
+            return c
+    return None
+
+
+def qupkake_available(env=QUPKAKE_ENV):
+    base = _conda_base()
+    return bool(base and ((base / "envs" / env / "bin" / "qupkake").exists()))
+
+
+def _neutral_heavy(mol):
+    """Heavy-atom copy (same atom order and coordinates) with charges
+    neutralised where possible (RDKit Uncharger)."""
+    from rdkit.Chem.MolStandardize import rdMolStandardize
+    heavy = Chem.RemoveHs(mol)
+    return rdMolStandardize.Uncharger().uncharge(heavy)
+
+
+def run_qupkake(mols, work_dir, n_proc=None, env=QUPKAKE_ENV, timeout=3600):
+    """Predict micro-pKa sites for molecules (neutralised first) with QupKake.
+
+    Returns a DataFrame: name, smiles (neutral, as submitted), idx (atom index
+    in that SMILES), site_atom, pka_type ('acidic'/'basic'), pka.
+    Molecules with no ionisable site have no rows; failures are listed in
+    the 'failed' attribute of the returned frame."""
+    work_dir = Path(work_dir).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    base = _conda_base()
+    if not qupkake_available(env):
+        raise RuntimeError(f"QupKake not found (conda env '{env}' with the qupkake command)")
+    rows = [{"name": m.GetProp("_Name"), "smiles": Chem.MolToSmiles(_neutral_heavy(m))} for m in mols]
+    pd.DataFrame(rows).to_csv(work_dir / "qupkake_input.csv", index=False)
+    n_proc = n_proc or max(1, min(len(rows), (os.cpu_count() or 2) - 2))
+    root = work_dir / "qupkake_root"
+    shutil.rmtree(root, ignore_errors=True)
+    script = f"""set -e
+source "{base}/etc/profile.d/conda.sh"
+conda activate {env}
+cd "{work_dir}"
+REAL_XTB="${{XTBPATH:-$(command -v xtb)}}"
+# QupKake passes -P <n> to every xtb call; force one thread per xtb process
+cat > xtb1 <<EOF
+#!/bin/bash
+args=(); skip=0
+for a in "\\$@"; do
+  if [ \\$skip = 1 ]; then args+=("1"); skip=0; continue; fi
+  [ "\\$a" = "-P" ] && skip=1
+  args+=("\\$a")
+done
+exec "$REAL_XTB" "\\${{args[@]}}"
+EOF
+chmod +x xtb1
+export XTBPATH="$PWD/xtb1"
+qupkake file qupkake_input.csv -s smiles -n name -mp {n_proc} -r qupkake_root -o qupkake_output.sdf
+"""
+    (work_dir / "run_qupkake.sh").write_text(script)
+    with open(work_dir / "qupkake.log", "w") as log:
+        rc = subprocess.run(["bash", str(work_dir / "run_qupkake.sh")], stdout=log,
+                            stderr=subprocess.STDOUT, timeout=timeout).returncode
+    out_sdf = root / "output" / "qupkake_output.sdf"
+    if rc != 0 or not out_sdf.exists():
+        raise RuntimeError(f"QupKake failed (exit {rc}); see {work_dir / 'qupkake.log'}")
+    smiles = {r["name"]: r["smiles"] for r in rows}
+    sites = []
+    for m in Chem.SDMolSupplier(str(out_sdf), removeHs=False):
+        if m is None:
+            continue
+        name = m.GetProp("_Name")
+        idx = int(m.GetProp("idx"))
+        pka = float(str(m.GetProp("pka")).replace("tensor(", "").rstrip(")"))
+        sites.append({"name": name, "smiles": smiles.get(name, ""), "idx": idx,
+                      "site_atom": m.GetAtomWithIdx(idx).GetSymbol(),
+                      "pka_type": m.GetProp("pka_type"), "pka": pka})
+    df = pd.DataFrame(sites, columns=["name", "smiles", "idx", "site_atom", "pka_type", "pka"])
+    errors = (root / "logs" / "error_log.txt")
+    failed = [r["name"] for r in rows if errors.exists() and r["name"] in errors.read_text()]
+    df.attrs["failed"] = failed
+    df.to_csv(work_dir / "qupkake_sites.csv", index=False)
+    return df
+
+
+def _implausible_basic(neutral, idx):
+    for label, smarts in IMPLAUSIBLE_BASIC_SMARTS.items():
+        patt = Chem.MolFromSmarts(smarts)
+        if any(match[0] == idx for match in neutral.GetSubstructMatches(patt)):
+            return label
+    return None
+
+
+def ionise_from_sites(mol, sites, ph=7.4, filter_implausible=True):
+    """Apply QupKake predictions to a molecule, keeping atom order and 3D
+    coordinates (hydrogens rebuilt). Returns (ionised_mol, record dict).
+
+    Rule: on the neutral molecule, protonate the most basic plausible site if
+    its pKa > pH and deprotonate the most acidic site if its pKa < pH (at most
+    one of each); other sites that also cross the pH are reported."""
+    name = mol.GetProp("_Name")
+    neutral = _neutral_heavy(mol)
+    rec = {"name": name, "input_charge": Chem.GetFormalCharge(mol), "sites": "", "ignored": "",
+           "protonated": "", "deprotonated": "", "also_crossing_pH": "", "predicted_charge": None}
+    s = sites[sites.name == name]
+    if len(s):
+        qk = Chem.MolFromSmiles(s.smiles.iloc[0])
+        match = neutral.GetSubstructMatch(qk)   # match[k] = our atom index of QupKake atom k
+        if not match:
+            raise ValueError(f"{name}: QupKake structure does not match the input")
+        s = s.assign(atom=[match[i] for i in s.idx])
+    else:
+        s = s.assign(atom=[])
+    lab = lambda r: f"{'b' if r.pka_type == 'basic' else 'a'}:{neutral.GetAtomWithIdx(int(r.atom)).GetSymbol()}{int(r.atom) + 1}={r.pka:.2f}"
+    rec["sites"] = "; ".join(lab(r) for r in s.sort_values("pka").itertuples())
+    basic = s[s.pka_type == "basic"].copy()
+    if filter_implausible and len(basic):
+        why = [_implausible_basic(neutral, int(a)) for a in basic.atom]
+        rec["ignored"] = "; ".join(f"{lab(r)} ({w})" for r, w in zip(basic.itertuples(), why) if w)
+        basic = basic[[w is None for w in why]]
+    acidic = s[s.pka_type == "acidic"]
+    rw = Chem.RWMol(neutral)
+    crossing = []
+    if len(basic) and basic.pka.max() > ph:
+        b = basic.loc[basic.pka.idxmax()]
+        a = rw.GetAtomWithIdx(int(b.atom))
+        a.SetNumExplicitHs(a.GetTotalNumHs() + 1); a.SetNoImplicit(True)
+        a.SetFormalCharge(a.GetFormalCharge() + 1)
+        rec["protonated"] = lab(b)
+        crossing += [lab(r) for r in basic.itertuples() if r.pka > ph and r.Index != b.name]
+    if len(acidic) and acidic.pka.min() < ph:
+        c = acidic.loc[acidic.pka.idxmin()]
+        a = rw.GetAtomWithIdx(int(c.atom))
+        if a.GetTotalNumHs() > 0:
+            a.SetNumExplicitHs(a.GetTotalNumHs() - 1); a.SetNoImplicit(True)
+            a.SetFormalCharge(a.GetFormalCharge() - 1)
+            rec["deprotonated"] = lab(c)
+        crossing += [lab(r) for r in acidic.itertuples() if r.pka < ph and r.Index != c.name]
+    rec["also_crossing_pH"] = "; ".join(crossing)
+    new = rw.GetMol()
+    Chem.SanitizeMol(new)
+    new = Chem.AddHs(new, addCoords=new.GetNumConformers() > 0)
+    for p in mol.GetPropNames():
+        new.SetProp(p, mol.GetProp(p))
+    new.SetProp("_Name", name)
+    rec["predicted_charge"] = Chem.GetFormalCharge(new)
+    new.SetProp("qupkake_pH", f"{ph:g}")
+    new.SetProp("qupkake_sites", rec["sites"])
+    new.SetProp("qupkake_charge", str(rec["predicted_charge"]))
+    rec["smiles"] = Chem.MolToSmiles(Chem.RemoveHs(new))
+    return new, rec
+
+
+def predict_ionisation(mols, work_dir, ph=7.4, filter_implausible=True, n_proc=None):
+    """Run QupKake on molecules and return (ionised mols, table)."""
+    sites = run_qupkake(mols, work_dir, n_proc=n_proc)
+    out, recs = [], []
+    for m in mols:
+        if m.GetProp("_Name") in sites.attrs.get("failed", []):
+            rec = {"name": m.GetProp("_Name"), "input_charge": Chem.GetFormalCharge(m),
+                   "predicted_charge": Chem.GetFormalCharge(m), "note": "QupKake failed - input state kept",
+                   "smiles": Chem.MolToSmiles(Chem.RemoveHs(m))}
+            out.append(Chem.Mol(m)); recs.append(rec)
+            continue
+        new, rec = ionise_from_sites(m, sites, ph, filter_implausible)
+        out.append(new); recs.append(rec)
+    table = pd.DataFrame(recs)
+    table["input_smiles"] = [Chem.MolToSmiles(Chem.RemoveHs(m)) for m in mols]
+    table.insert(1, "changed", table.input_smiles != table.smiles)  # same charge can still mean a different site
+    return out, table
+
+
+class ProtonationPanel:
+    """Predict ionisation states with QupKake and write them as a new SDF
+    (<input>_pH<pH>.sdf) that the rest of the notebook docks."""
+
+    def __init__(self, mols, input_sdf):
+        self.mols, self.input_sdf = mols, Path(input_sdf)
+        style = {"description_width": "160px"}
+        self.ph = widgets.BoundedFloatText(value=7.4, min=0, max=14, step=0.1, description="pH", style=style)
+        self.filter = widgets.Checkbox(value=True, layout=widgets.Layout(width="95%"),
+                                       description="Ignore implausible basic sites (sulphonamide, amide and aryl-amine N)")
+        self.use = widgets.Checkbox(value=True, layout=widgets.Layout(width="95%"),
+                                    description="Dock the ligands in their predicted ionisation states")
+        self.button = widgets.Button(description="Run QupKake", button_style="success", icon="play")
+        self.out = widgets.Output()
+        self.table = None
+        self.ionised = None
+        self.button.on_click(lambda _: self.run())
+        ok = qupkake_available()
+        self.status = widgets.HTML("" if ok else
+                                   "<span style='color:#b00'>QupKake not found (conda env 'qupkake'); "
+                                   "the input ionisation states will be used.</span>")
+        self.button.disabled = not ok
+
+    @property
+    def output_sdf(self):
+        return self.input_sdf.with_name(f"{self.input_sdf.stem}_pH{self.ph.value:g}.sdf")
+
+    def widget(self):
+        return widgets.VBox([self.status, self.ph, self.filter, self.use, self.button, self.out])
+
+    def run(self):
+        self.out.clear_output()
+        with self.out:
+            print("Running QupKake (GFN2-xTB + GNN); about 30 s for 10 molecules ...")
+            work = self.input_sdf.parent / "qupkake" / self.input_sdf.stem
+            self.ionised, self.table = predict_ionisation(self.mols, work, self.ph.value, self.filter.value)
+            with Chem.SDWriter(str(self.output_sdf)) as w:
+                for m in self.ionised:
+                    w.write(m)
+            self.table.to_csv(self.output_sdf.with_suffix(".csv"), index=False)
+            print(f"Ionisation states written to {self.output_sdf} (table: {self.output_sdf.with_suffix('.csv').name}; "
+                  f"QupKake files in {work})")
+            display(self.table[["name", "changed", "input_charge", "predicted_charge", "protonated", "deprotonated",
+                                "ignored", "also_crossing_pH", "input_smiles", "smiles"]])
+        return self.table
+
+    def docking_input(self):
+        """(molecules, SDF path) to dock: predicted states if run and selected."""
+        if self.use.value and self.ionised is not None:
+            return self.ionised, self.output_sdf
+        return self.mols, self.input_sdf
+
+
+def ionise_reference_ligand(mol, work_dir, ph=7.4, filter_implausible=True):
+    """Predicted ionisation state of the PDB ligand, keeping its crystal
+    coordinates. Returns (mol, table)."""
+    mols, table = predict_ionisation([mol], work_dir, ph, filter_implausible)
+    return mols[0], table
+
+
+# --------------------------------------------------------------------------
 # Protein-ligand complex handling
 # --------------------------------------------------------------------------
 def _res_key(line):
     return (line[17:20].strip(), line[21], line[22:26].strip(), line[26].strip())
 
 
-def list_het_groups(pdb_path):
-    """Non-water HETATM residues in a PDB file (largest first)."""
+# --------------------------------------------------------------------------
+# Structure files: PDB or mmCIF (gemmi), HET-group classification
+# --------------------------------------------------------------------------
+SOLVENT_ADDITIVES = {
+    "DMS", "DMF", "DMX", "EDO", "GOL", "PEG", "PGE", "PG4", "1PE", "P6G", "PE4", "PE8", "2PE", "MPD",
+    "MRD", "IPA", "EOH", "MOH", "BU3", "ACT", "ACY", "ACE", "FMT", "SO4", "PO4", "NO3", "SCN", "AZI",
+    "CIT", "FLC", "TRS", "MES", "EPE", "BME", "DTT", "IMD", "TAR", "MLI", "SIN", "BTB", "B3P", "NHE",
+    "CAC", "BCT", "CO3", "PG0", "OXY", "PEO", "HEZ", "DOD", "UNX"}
+ION_NAMES = METAL_NAMES | {"CL", "BR", "IOD", "F", "LI", "RB", "CS", "SR", "BA", "AL", "CU1", "NI2",
+                           "CO3", "HO", "YB", "GD", "SM", "PT", "AU", "AG"}
+CAP_NAMES = {"NME", "NH2", "ACE", "FOR"}  # terminal caps on the polymer, not ligands
+GENERIC_LIGAND_CODES = {"LIG", "UNL", "UNK", "UNX", "DRG", "INH", "MOL", "XXX", "LG1", "LG2", "INI"}
+_STRUCTURE_CACHE = {}
+
+
+def _structure_kind(path):
+    """'pdb' or 'cif' (also for .gz); anything else is treated as PDB."""
+    name = Path(path).name.lower()
+    name = name[:-3] if name.endswith(".gz") else name
+    return "cif" if name.endswith((".cif", ".mmcif")) else "pdb"
+
+
+def structure_stem(path):
+    """Stem used for files derived from a structure; mmCIF input gets a
+    '_cif' suffix so its outputs never overwrite those from a PDB file of the
+    same entry (the two may use different coordinate frames)."""
+    name = Path(path).name
+    for ext in (".gz", ".cif", ".mmcif", ".pdb", ".ent"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+    return name + ("_cif" if _structure_kind(path) == "cif" else "")
+
+
+def read_structure_text(path):
+    """(PDB-format text, {residue name: chemical name}) for a PDB or mmCIF
+    file. mmCIF (optionally gzipped) is converted with gemmi, keeping
+    HELIX/SHEET records, formal charges and alternate locations."""
+    path = Path(path)
+    key = (str(path.resolve()), path.stat().st_mtime)
+    if key in _STRUCTURE_CACHE:
+        return _STRUCTURE_CACHE[key]
+    names = {}
+    if _structure_kind(path) == "cif" or path.suffix.lower() == ".gz":
+        import gemmi
+        st = gemmi.read_structure(str(path))
+        st.setup_entities()
+        if len(st) > 1:
+            del st[1:]  # first model only
+        text = st.make_pdb_string()
+        if _structure_kind(path) == "cif":
+            block = gemmi.cif.read(str(path)).sole_block()
+            for row in block.find("_chem_comp.", ["id", "name"]):
+                names[row[0]] = gemmi.cif.as_string(row[1]).strip()
+    else:
+        text = path.read_text()
+    hetnam = {}
+    for line in text.splitlines():  # HETNAM records of PDB files (with continuation lines)
+        if line.startswith("HETNAM"):
+            code, part = line[11:14].strip(), line[15:70].strip()
+            prev = hetnam.get(code, "")
+            hetnam[code] = (prev + ("" if not prev or prev.endswith("-") else " ") + part) if line[8:10].strip() else part
+    for code, name in hetnam.items():
+        names.setdefault(code, name)
+    _STRUCTURE_CACHE[key] = (text, names)
+    return text, names
+
+
+def het_category(resname, n_atoms):
+    if resname in WATER_NAMES:
+        return "water"
+    if resname in CAP_NAMES:
+        return "terminal cap"
+    if resname in ION_NAMES or n_atoms == 1:
+        return "ion"
+    if resname in SOLVENT_ADDITIVES:
+        return "solvent/additive"
+    return "ligand"
+
+
+def list_het_groups(path, include_all=False):
+    """HET groups in a PDB or mmCIF file, ligands first (largest first).
+
+    Waters are never listed. Solvents, crystallisation additives, ions and
+    terminal caps are listed only with include_all=True. Alternate locations
+    count once. Columns: resname, chain, resnum, icode, atoms, name, category."""
+    text, names = read_structure_text(path)
     groups = OrderedDict()
-    with open(pdb_path) as f:
-        for line in f:
-            if line.startswith("HETATM"):
-                key = _res_key(line)
-                if key[0] in WATER_NAMES:
-                    continue
-                groups.setdefault(key, 0)
-                groups[key] += 1
-    rows = [{"resname": k[0], "chain": k[1], "resnum": k[2], "icode": k[3],
-             "atoms": n} for k, n in groups.items()]
-    df = pd.DataFrame(rows)
+    for line in text.splitlines():
+        if line.startswith("HETATM") and line[16] in (" ", "A"):
+            key = _res_key(line)
+            if key[0] in WATER_NAMES:
+                continue
+            groups[key] = groups.get(key, 0) + 1
+    rows = []
+    for k, n in groups.items():
+        cat = het_category(k[0], n)
+        rows.append({"resname": k[0], "chain": k[1], "resnum": k[2], "icode": k[3], "atoms": n,
+                     "name": names.get(k[0], ""), "category": cat})
+    df = pd.DataFrame(rows, columns=["resname", "chain", "resnum", "icode", "atoms", "name", "category"])
+    if not include_all:
+        df = df[df.category == "ligand"]
     if not df.empty:
-        df = df.sort_values("atoms", ascending=False, kind="stable").reset_index(drop=True)
+        df = df.assign(_lig=(df.category != "ligand")).sort_values(
+            ["_lig", "atoms"], ascending=[True, False], kind="stable").drop(columns="_lig").reset_index(drop=True)
     return df
 
 
 def het_label(row):
-    return f"{row['resname']} {row['chain']} {row['resnum']}{row['icode']} ({row['atoms']} atoms)"
+    name = str(row.get("name", "") or "")
+    name = (name[:45] + "…") if len(name) > 46 else name
+    label = f"{row['resname']} {row['chain']} {row['resnum']}{row['icode']}"
+    if name:
+        label += f" – {name}"
+    label += f" ({row['atoms']} atoms)"
+    if row.get("category", "ligand") != "ligand":
+        label += f" [{row['category']}]"
+    return label
+
+
+_CCD_CACHE = {}
+
+
+def ccd_smiles(code, timeout=10):
+    """SMILES for a PDB Chemical Component Dictionary code from RCSB
+    (None if offline, unknown, or a generic code like LIG/UNL)."""
+    code = code.upper()
+    if code in GENERIC_LIGAND_CODES:
+        return None
+    if code not in _CCD_CACHE:
+        import json
+        import urllib.request
+        try:
+            with urllib.request.urlopen(f"https://data.rcsb.org/rest/v1/core/chemcomp/{code}",
+                                        timeout=timeout) as r:
+                d = json.load(r).get("rcsb_chem_comp_descriptor", {})
+            _CCD_CACHE[code] = d.get("SMILES_stereo") or d.get("SMILES")
+        except Exception:
+            _CCD_CACHE[code] = None
+    return _CCD_CACHE[code]
 
 
 def _bond_orders_from_template(mol, smiles):
@@ -584,6 +955,9 @@ def _bond_orders_from_template(mol, smiles):
         a.SetFormalCharge(0)
         a.SetIsAromatic(False)
         a.SetNoImplicit(False)
+    if template.GetNumHeavyAtoms() != heavy.GetNumHeavyAtoms():
+        raise ValueError(f"SMILES template has {template.GetNumHeavyAtoms()} heavy atoms, "
+                         f"the ligand has {heavy.GetNumHeavyAtoms()}")
     fixed = AllChem.AssignBondOrdersFromTemplate(template, heavy)
     return Chem.AddHs(fixed, addCoords=True)
 
@@ -601,18 +975,25 @@ def _bond_orders_openbabel(pdb_block):
     return mol
 
 
-def extract_ligand(pdb_path, het, smiles=None):
-    """Extract one HET group (a row of list_het_groups) as an RDKit molecule.
+def extract_ligand(pdb_path, het, smiles=None, use_ccd=True):
+    """Extract one HET group (a row of list_het_groups) from a PDB or mmCIF
+    file as an RDKit molecule (first alternate location only).
 
-    Bond orders: SMILES template if given; else RDKit DetermineBondOrders when
-    hydrogens are present (charge from the PDB formal charges); else Open
-    Babel perception from the heavy-atom geometry.
+    Bond orders, in order of preference:
+      1. the SMILES template, if given (its charges are kept, so it can set
+         the protonation state);
+      2. RDKit DetermineBondOrders when hydrogens are present (net charge from
+         the file's formal charges);
+      3. the ligand's PDB Chemical Component Dictionary SMILES from RCSB, if
+         the code is a registered one and its heavy atoms match (no hydrogens,
+         e.g. RCSB X-ray files; neutral form);
+      4. Open Babel perception from the heavy-atom geometry.
     Returns (mol, ligand_pdb_block, method).
     """
     key = (het["resname"], het["chain"], str(het["resnum"]), het["icode"])
     lines, serials = [], set()
-    with open(pdb_path) as f:
-        all_lines = f.readlines()
+    text, _ = read_structure_text(pdb_path)
+    all_lines = text.splitlines(True)
     for line in all_lines:
         if line.startswith("HETATM") and _res_key(line) == key:
             alt = line[16]
@@ -654,7 +1035,16 @@ def extract_ligand(pdb_path, het, smiles=None):
         except Exception:
             mol, method = _bond_orders_openbabel(block), "Open Babel perception"
     else:
-        mol, method = _bond_orders_openbabel(block), "Open Babel perception (H added)"
+        mol = method = None
+        ccd = ccd_smiles(key[0]) if use_ccd else None
+        if ccd:
+            try:
+                mol = _bond_orders_from_template(raw, ccd)
+                method = f"PDB Chemical Component Dictionary template for {key[0]} (RCSB; neutral form, H added)"
+            except Exception:
+                mol = None
+        if mol is None:
+            mol, method = _bond_orders_openbabel(block), "Open Babel perception (H added)"
     Chem.AssignStereochemistryFrom3D(mol)
     name = f"{key[0]}_{key[1]}{key[2]}{key[3]}"
     mol.SetProp("_Name", name)
@@ -666,25 +1056,29 @@ def write_complex_split(pdb_path, het, mol, ligand_block,
     """Write <stem>_protein.pdb and <stem>_ligand_<RES><chain><num>.pdb/.sdf
     next to the complex PDB. Other HET groups are removed (metals optional)."""
     pdb_path = Path(pdb_path)
-    folder, stem = pdb_path.parent, pdb_path.stem
+    folder, stem = pdb_path.parent, structure_stem(pdb_path)
     tag = f"{het['resname']}{het['chain']}{het['resnum']}{het['icode']}"
     prot_path = folder / f"{stem}_protein.pdb"
     lig_pdb = folder / f"{stem}_ligand_{tag}.pdb"
     lig_sdf = folder / f"{stem}_ligand_{tag}.sdf"
 
     kept = []
-    with open(pdb_path) as f:
-        for line in f:
-            rec = line[:6]
-            if rec.startswith(("ATOM", "HELIX", "SHEET", "TURN")):
+    text, _ = read_structure_text(pdb_path)
+    for line in text.splitlines(True):
+        rec = line[:6]
+        if rec.startswith(("ATOM", "HETATM")):
+            if line[16] not in (" ", "A"):
+                continue  # keep the first alternate location only
+            line = line[:16] + " " + line[17:]
+        if rec.startswith(("ATOM", "HELIX", "SHEET", "TURN")):
+            kept.append(line)
+        elif rec == "HETATM":
+            resn = line[17:20].strip()
+            if (keep_waters and resn in WATER_NAMES) or \
+               (keep_metals and resn in METAL_NAMES):
                 kept.append(line)
-            elif rec == "HETATM":
-                resn = line[17:20].strip()
-                if (keep_waters and resn in WATER_NAMES) or \
-                   (keep_metals and resn in METAL_NAMES):
-                    kept.append(line)
-            elif rec.startswith("TER"):
-                kept.append(line)
+        elif rec.startswith("TER"):
+            kept.append(line)
     with open(prot_path, "w") as f:
         f.writelines(kept)
         f.write("END\n")
@@ -701,8 +1095,11 @@ def write_complex_split(pdb_path, het, mol, ligand_block,
 class BindingSiteSetup:
     """Choose the receptor and the ligand that defines the binding site.
 
-    Mode "Complex PDB": load a protein-ligand complex, pick a HET group, and
-    write <stem>_protein.pdb + <stem>_ligand_*.pdb/.sdf next to the PDB.
+    Mode "Complex PDB": load a protein-ligand complex (PDB or mmCIF), pick
+    the ligand that defines the site (all ligands are listed, largest
+    pre-selected; solvents/ions/additives on request), and write
+    <stem>_protein.pdb + <stem>_ligand_*.pdb/.sdf next to the input
+    (<stem> gets '_cif' for mmCIF input).
     Mode "Prepared files": use an existing protein (no ligand) PDB and an
     extracted ligand PDB, as in the original notebook.
     After apply(): .protein, .ligand_pdb (autobox), .ligand_ref (display),
@@ -712,11 +1109,16 @@ class BindingSiteSetup:
     def __init__(self, complex_pdb, protein_pdb, ligand_pdb, mode="Complex PDB"):
         style = {"description_width": "160px"}
         wide = widgets.Layout(width="95%")
-        self.mode = widgets.ToggleButtons(options=["Complex PDB", "Prepared files"], value=mode,
-                                          description="Input type", style=style)
-        self.complex_pdb = widgets.Text(value=str(complex_pdb), description="Complex PDB", style=style, layout=wide)
-        self.load_button = widgets.Button(description="Load HET groups", icon="refresh")
-        self.het = widgets.Dropdown(description="Site-defining ligand", style=style, layout=widgets.Layout(width="60%"))
+        self.mode = widgets.ToggleButtons(options=[("Complex structure (PDB/mmCIF)", "Complex PDB"),
+                                                   ("Prepared files", "Prepared files")], value=mode,
+                                          description="Input type", style={**style, "button_width": "230px"})
+        self.complex_pdb = widgets.Text(value=str(complex_pdb), description="Complex (PDB/mmCIF)", style=style,
+                                        layout=wide, continuous_update=False)
+        self.load_button = widgets.Button(description="Reload ligands", icon="refresh")
+        self.show_all = widgets.Checkbox(value=False, description="Also list solvents, ions, additives and caps",
+                                         layout=widgets.Layout(width="95%"))
+        self.het = widgets.Dropdown(description="Site-defining ligand", style=style, layout=widgets.Layout(width="95%"))
+        self.het_info = widgets.HTML()
         self.smiles = widgets.Text(value="", placeholder="optional: SMILES to assign bond orders",
                                    description="SMILES template", style=style, layout=wide)
         self.keep_waters = widgets.Checkbox(value=False, description="Keep waters in protein",
@@ -727,13 +1129,17 @@ class BindingSiteSetup:
         self.ligand_pdb_w = widgets.Text(value=str(ligand_pdb), description="Ligand from protein", style=style, layout=wide)
         self.apply_button = widgets.Button(description="Use this binding site", button_style="success", icon="check")
         self.out = widgets.Output()
-        self.complex_box = widgets.VBox([self.complex_pdb, self.load_button, self.het, self.smiles,
+        self.complex_box = widgets.VBox([self.complex_pdb, widgets.HBox([self.load_button, self.show_all]),
+                                         self.het, self.het_info, self.smiles,
                                          widgets.HBox([self.keep_waters, self.keep_metals])])
         self.prepared_box = widgets.VBox([self.protein_pdb, self.ligand_pdb_w])
         self.protein = self.ligand_pdb = self.ligand_ref = self.image_prefix = None
         self.ligand_mol = None
         self.mode.observe(self._toggle, names="value")
         self.load_button.on_click(lambda _: self.load_hets())
+        self.complex_pdb.observe(lambda _: self.load_hets(), names="value")
+        self.show_all.observe(lambda _: self.load_hets(), names="value")
+        self.het.observe(lambda _: self._update_het_info(), names="value")
         self.apply_button.on_click(lambda _: self.apply())
         self._toggle()
         self.load_hets()
@@ -744,17 +1150,39 @@ class BindingSiteSetup:
         self.prepared_box.layout.display = "none" if cplx else ""
 
     def load_hets(self):
+        """List the ligands in the complex; pre-select the largest."""
+        self._auto = None
         try:
-            self._hets = list_het_groups(self.complex_pdb.value)
-        except FileNotFoundError:
-            self._hets = pd.DataFrame()
+            self._hets = list_het_groups(self.complex_pdb.value, include_all=self.show_all.value)
+            if self._hets.empty and not self.show_all.value:   # no ligand: show everything instead
+                self._hets = list_het_groups(self.complex_pdb.value, include_all=True)
+            self._error = None
+        except Exception as e:
+            self._hets, self._error = pd.DataFrame(), str(e)
+        self._auto = 0 if len(self._hets) else None  # ligands first, largest first
         self.het.options = [(het_label(r), i) for i, r in self._hets.iterrows()]
         if len(self._hets):
-            self.het.value = 0  # largest HET group
-        if len(self._hets) > 1:
-            with self.out:
-                print(f"{len(self._hets)} HET groups found (waters excluded); "
-                      f"the largest is pre-selected - change it if needed.")
+            self.het.value = 0
+        self._update_het_info()
+
+    def _update_het_info(self):
+        if self._error:
+            self.het_info.value = f"<span style='color:#b00'>Could not read {self.complex_pdb.value}: {self._error}</span>"
+            return
+        if not len(self._hets):
+            self.het_info.value = "<span style='color:#b00'>No HET groups found.</span>"
+            return
+        n_lig = int((self._hets.category == "ligand").sum())
+        auto = het_label(self._hets.iloc[self._auto])
+        if self.het.value == self._auto:
+            msg = (f"<b>Automatically selected:</b> {auto} &ndash; the largest ligand. "
+                   f"{'Choose another from the list if needed. ' if len(self._hets) > 1 else ''}")
+        else:
+            msg = f"<b>Your choice</b> (automatic selection was {auto}). "
+        msg += f"<i>{n_lig} ligand(s) listed"
+        msg += "; solvents, ions, additives and caps included.</i>" if self.show_all.value else \
+               "; waters, solvents, ions, additives and terminal caps hidden &ndash; tick the box to list them.</i>"
+        self.het_info.value = msg
 
     def widget(self):
         return widgets.VBox([self.mode, self.complex_box, self.prepared_box, self.apply_button, self.out])
@@ -769,7 +1197,7 @@ class BindingSiteSetup:
                 prot, lig_pdb, lig_sdf = write_complex_split(pdb, het, mol, block,
                                                              self.keep_waters.value, self.keep_metals.value)
                 self.protein, self.ligand_pdb, self.ligand_ref = prot, lig_pdb, lig_sdf
-                self.image_prefix = pdb.parent / pdb.stem
+                self.image_prefix = pdb.parent / structure_stem(pdb)
             else:
                 self.protein = Path(self.protein_pdb.value)
                 self.ligand_pdb = self.ligand_ref = Path(self.ligand_pdb_w.value)
@@ -778,7 +1206,7 @@ class BindingSiteSetup:
                     if not f.exists():
                         raise FileNotFoundError(f)
                 mol = method = None
-                hets = list_het_groups(self.ligand_pdb)
+                hets = list_het_groups(self.ligand_pdb, include_all=True)
                 if len(hets):
                     mol, _, method = extract_ligand(self.ligand_pdb, hets.iloc[0])
                 print(f"Protein for docking : {self.protein}")
@@ -1059,8 +1487,172 @@ def build_flexed_receptor(protein_text, flex_block):
 
 
 # --------------------------------------------------------------------------
+# Run provenance
+# --------------------------------------------------------------------------
+def file_sha256(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def smina_version(smina):
+    try:
+        r = subprocess.run([str(smina), "--version"], capture_output=True, text=True, timeout=30)
+        return (r.stdout + r.stderr).strip().splitlines()[0]
+    except Exception as e:
+        return f"unknown ({e})"
+
+
+def software_versions():
+    import importlib
+    out = {"python": platform.python_version()}
+    for name in ("rdkit", "numpy", "pandas", "torch", "torch_geometric", "torchani"):
+        try:
+            out[name] = importlib.import_module(name).__version__
+        except Exception:
+            out[name] = "not installed"
+    return out
+
+
+def _now():
+    import datetime
+    return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def smina_run_info(cmd, panel):
+    """Everything needed to repeat a smina run: version, command, settings,
+    platform and SHA-256 of the input files."""
+    inputs = {"receptor": panel.receptor.value, "ligands": panel.ligands.value}
+    if not panel.minimize.value:
+        inputs["autobox_ligand"] = panel.autobox.value
+    return {
+        "created": _now(),
+        "smina": {"path": panel.smina.value, "version": smina_version(panel.smina.value)},
+        "command": shlex.join(cmd),
+        "settings": {
+            "mode": "minimize" if panel.minimize.value else ("flexible" if panel.flexible else "rigid"),
+            "seed": panel.seed.value, "cpu": panel.cpu.value,
+            "exhaustiveness": panel.exhaustiveness.value, "num_modes": panel.num_modes.value,
+            "energy_range": panel.energy_range.value, "autobox_add": panel.autobox_add.value,
+            "scoring": panel.scoring_arg or "vina",
+            "flexres": panel.flexres() if panel.flexible else [],
+            "extra_arguments": panel.extra.value.strip(),
+        },
+        "inputs": {k: {"path": v, "sha256": file_sha256(v) if Path(v).exists() else None}
+                   for k, v in inputs.items()},
+        "platform": {"system": platform.system(), "release": platform.release(),
+                     "machine": platform.machine(), "logical_cpus": os.cpu_count()},
+        "box": (None if panel.minimize.value or any(a in panel.extra.value for a in ("--center_", "--size_"))
+                else box_check(panel.autobox.value, panel.autobox_add.value, panel.ligands.value)[0]),
+        "note": ("With this smina build (Vina 1.1.2 based) the same --seed gave identical poses "
+                 "for --cpu 1-24; record kept so the run can be repeated exactly."),
+    }
+
+
+# --------------------------------------------------------------------------
 # smina panel
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Search-box checks
+# --------------------------------------------------------------------------
+BOX_EDGE_MARGIN = 1.0   # Å: poses with a heavy atom closer than this to a box face are flagged
+BOX_TIGHT = 2.0         # Å: a ligand longer than (smallest box side - this) is reported as tight
+VINA_MAX_VOLUME = 27000  # Å^3: Vina warns above this search volume
+
+
+def _all_atom_coords(path):
+    path = Path(path)
+    if path.suffix.lower() in (".sdf", ".mol"):
+        m = next(iter(Chem.SDMolSupplier(str(path), removeHs=False, sanitize=False)))
+        return m.GetConformer().GetPositions()
+    return np.array([[float(l[30:38]), float(l[38:46]), float(l[46:54])]
+                     for l in open(path) if l.startswith(("ATOM", "HETATM"))])
+
+
+def autobox_bounds(autobox_ligand, autobox_add):
+    """(min corner, max corner) of smina's --autobox_ligand box: the bounding
+    box of ALL atoms in the file (hydrogens included - verified with smina
+    dc3dfab) expanded by autobox_add on every side."""
+    xyz = _all_atom_coords(autobox_ligand)
+    return xyz.min(0) - autobox_add, xyz.max(0) + autobox_add
+
+
+_SPAN_CACHE = {}
+
+
+def ligand_spans(sdf):
+    """{name: longest heavy-atom distance (Å) over all its conformers in sdf}."""
+    sdf = Path(sdf)
+    key = (str(sdf.resolve()), sdf.stat().st_mtime)
+    if key not in _SPAN_CACHE:
+        spans = {}
+        RDLogger.DisableLog("rdApp.warning")
+        try:
+            for m in Chem.SDMolSupplier(str(sdf), removeHs=False, sanitize=False):
+                if m is None or not m.GetNumConformers():
+                    continue
+                P = m.GetConformer().GetPositions()[[a.GetAtomicNum() > 1 for a in m.GetAtoms()]]
+                d = float(np.linalg.norm(P[:, None] - P[None], axis=-1).max()) if len(P) > 1 else 0.0
+                n = m.GetProp("_Name")
+                spans[n] = max(spans.get(n, 0.0), d)
+        finally:
+            RDLogger.EnableLog("rdApp.warning")
+        _SPAN_CACHE[key] = spans
+    return _SPAN_CACHE[key]
+
+
+def box_check(autobox_ligand, autobox_add, ligands_sdf):
+    """Compare each ligand's longest span with the search box.
+    Returns (box dict, DataFrame name/span/status, suggested autobox_add or None)."""
+    lo, hi = autobox_bounds(autobox_ligand, autobox_add)
+    size = hi - lo
+    smallest = float(size.min())
+    rows = []
+    for name, span in ligand_spans(ligands_sdf).items():
+        status = ("longer than smallest box side" if span > smallest else
+                  "tight" if span > smallest - BOX_TIGHT else "ok")
+        rows.append({"name": name, "span": round(span, 1), "status": status})
+    df = pd.DataFrame(rows, columns=["name", "span", "status"])
+    suggest = None
+    if len(df) and (df.status != "ok").any():
+        ref_extent = float((size - 2 * autobox_add).min())       # reference ligand along its narrowest axis
+        need = (df.span.max() + BOX_TIGHT - ref_extent) / 2
+        suggest = float(np.ceil(need * 2) / 2)                    # round up to 0.5 Å
+    box = {"min": [round(float(v), 3) for v in lo], "max": [round(float(v), 3) for v in hi],
+           "size": [round(float(v), 2) for v in size], "volume": round(float(np.prod(size)))}
+    return box, df, suggest
+
+
+def box_from_run_record(record):
+    """Search box of a smina run: stored in its run record, or rebuilt from
+    the recorded autobox ligand and autobox_add (older records)."""
+    if not record:
+        return None
+    if record.get("box"):
+        return record["box"]
+    st, inp = record.get("settings", {}), record.get("inputs", {})
+    path = inp.get("autobox_ligand", {}).get("path")
+    if st.get("mode") in ("rigid", "flexible") and path and Path(path).exists():
+        lo, hi = autobox_bounds(path, float(st.get("autobox_add", 4.0)))
+        size = hi - lo
+        return {"min": lo.tolist(), "max": hi.tolist(), "size": size.tolist(), "volume": float(np.prod(size))}
+    return None
+
+
+def box_margins(mols, box):
+    """Smallest distance (Å) from any heavy atom of each pose to a box face;
+    negative = outside the box."""
+    lo, hi = np.array(box["min"]), np.array(box["max"])
+    out = []
+    for m in mols:
+        P = m.GetConformer().GetPositions()[[a.GetAtomicNum() > 1 for a in m.GetAtoms()]]
+        out.append(float(np.minimum(P - lo, hi - P).min()))
+    return out
+
+
 FLEX_WARNING = (
     "<div style='background:#fff3cd;color:#664d03;border-left:5px solid #e0a800;padding:6px 10px;margin:4px 0'>"
     "<b>&#9888; Flexible docking is much slower than rigid docking</b> &ndash; typically 10&ndash;100&times; "
@@ -1085,7 +1677,7 @@ class SminaPanel:
         self.exhaustiveness = widgets.BoundedIntText(value=20, min=1, max=256, description="exhaustiveness", style=style)
         self.seed = widgets.IntText(value=0, description="seed", style=style)
         self.cpu = widgets.BoundedIntText(value=total, min=1, max=total, description="cpu", style=style)
-        self.cpu_label = widgets.HTML(f"<i>{cpu_note()}. smina uses up to this many threads per ligand.</i>")
+        self.cpu_label = widgets.HTML(f"<i>{cpu_note()}. smina uses up to this many threads per ligand; with the same seed the poses do not depend on it (tested 1-24).</i>")
         self.autobox_add = widgets.BoundedFloatText(value=4.0, min=0, max=20, step=0.5, description="autobox_add (Å)", style=style)
         self.num_modes = widgets.BoundedIntText(value=9, min=1, max=100, description="num_modes", style=style)
         self.energy_range = widgets.BoundedFloatText(value=3.0, min=0, max=20, description="energy_range", style=style)
@@ -1117,6 +1709,7 @@ class SminaPanel:
                                       widgets.HBox([self.flex_dist, self.flex_find]),
                                       self.flex_list, self.flex_help, self.flex_extra, self.flex_summary])
         self.extra = widgets.Text(value="", description="extra arguments", style=style, layout=wide)
+        self.box_info = widgets.HTML()
         self.preview = widgets.Textarea(layout=widgets.Layout(width="95%", height="90px"), disabled=True)
         self.run_button = widgets.Button(description="Run smina", button_style="success", icon="play")
         self.log = widgets.Output(layout=widgets.Layout(max_height="300px", overflow="auto", border="1px solid #ccc"))
@@ -1202,6 +1795,41 @@ class SminaPanel:
             self.flex_summary.value = (f"<span style='color:{colour}'><b>{len(res)} flexible residues</b>{note}: "
                                        f"{', '.join(names.get(r, r) for r in res) or 'none'}</span>")
         self.preview.value = shlex.join(self.command())
+        self._update_box_info()
+
+    def _update_box_info(self):
+        """Pre-docking check: does every ligand fit the search box?"""
+        if self.minimize.value:
+            self.box_info.value = "<i>--minimize: no search box.</i>"
+            return
+        if any(a in self.extra.value for a in ("--center_", "--size_")):
+            self.box_info.value = "<i>Box set explicitly in extra arguments; box check skipped.</i>"
+            return
+        if not Path(self.ligands.value).exists():
+            self.box_info.value = "<i>Box check: generate the conformers first.</i>"
+            return
+        try:
+            box, df, suggest = box_check(self.autobox.value, self.autobox_add.value, self.ligands.value)
+        except Exception as e:
+            self.box_info.value = f"<i>Box check not available: {e}</i>"
+            return
+        x, y, z = box["size"]
+        msg = (f"<b>Search box</b> {x:.1f} × {y:.1f} × {z:.1f} Å ({box['volume']:,} Å³; autobox ligand + "
+               f"{self.autobox_add.value:g} Å). ")
+        if box["volume"] > VINA_MAX_VOLUME:
+            msg += f"<span style='color:#b00'>Larger than {VINA_MAX_VOLUME:,} Å³ – raise exhaustiveness.</span> "
+        if len(df):
+            bad = df[df.status != "ok"]
+            msg += f"Longest ligand: {df.loc[df.span.idxmax(), 'name']} ({df.span.max():.1f} Å; smallest box side {min(box['size']):.1f} Å). "
+            if len(bad):
+                items = ", ".join(f"{r.name} {r.span:.1f} Å ({r.status})" for r in bad.itertuples())
+                msg = ("<div style='background:#fff3cd;color:#664d03;border-left:5px solid #e0a800;padding:6px 10px'>"
+                       + msg + f"<br><b>&#9888; May be limited by the box:</b> {items}. "
+                       f"Consider <b>autobox_add ≥ {suggest:g} Å</b> (and a higher exhaustiveness).</div>")
+            else:
+                msg += "<span style='color:#1a7f37'>&#10004; All ligands fit with ≥ "\
+                       f"{BOX_TIGHT:g} Å to spare.</span>"
+        self.box_info.value = msg
 
     def command(self):
         c = [self.smina.value, "-r", self.receptor.value, "-l", self.ligands.value,
@@ -1228,7 +1856,7 @@ class SminaPanel:
                                widgets.HBox([self.cpu, self.cpu_label]),
                                widgets.HBox([self.autobox_add, self.num_modes]),
                                widgets.HBox([self.energy_range, self.scoring]),
-                               self.minimize, self.minimize_note, self.extra])
+                               self.minimize, self.minimize_note, self.extra, self.box_info])
         flex = widgets.VBox([widgets.HTML("<b>Receptor flexibility</b>"), self.mode, self.flex_box])
         return widgets.VBox([files, params, flex, widgets.HTML("<b>Command</b>"), self.preview,
                              self.run_button, self.log])
@@ -1245,14 +1873,51 @@ class SminaPanel:
             return 1
         out = Path(self.output.value)
         log_path = out.with_suffix(".log")
+        lig_path = Path(self.ligands.value)
+        input_titles = sdf_titles(lig_path) if lig_path.suffix.lower() == ".sdf" else None
+        bad_records = []
+        if input_titles is not None:
+            RDLogger.DisableLog("rdApp.*")
+            try:
+                bad_records = [i for i, m in enumerate(Chem.SDMolSupplier(str(lig_path), removeHs=False,
+                                                                          sanitize=False)) if m is None]
+            finally:
+                RDLogger.EnableLog("rdApp.*")
         if not self.flexible and self.flex_output.exists():
             self.flex_output.unlink()  # stale flexible residues from an earlier run with this name
         self.log.clear_output()
         self.run_button.disabled = True
+        info = smina_run_info(cmd, self)
+        info_path = out.with_name(out.stem + ".run.json")
         try:
             with self.log, open(log_path, "w") as logf:
                 print("$ " + shlex.join(cmd))
-                logf.write("$ " + shlex.join(cmd) + "\n")
+                st = info["settings"]
+                header = (f"# {info['smina']['version']}\n"
+                          f"# mode {st['mode']}  seed {st['seed']}  cpu {st['cpu']}  "
+                          f"exhaustiveness {st['exhaustiveness']}  scoring {st['scoring']}\n"
+                          f"# platform {info['platform']['system']} {info['platform']['machine']}  "
+                          f"started {info['created']}\n"
+                          f"# run record: {info_path.name}\n")
+                logf.write(header + "$ " + shlex.join(cmd) + "\n")
+                print(header, end="")
+                if info.get("box"):
+                    bx = info["box"]
+                    _, spans, sugg = box_check(self.autobox.value, self.autobox_add.value, self.ligands.value)
+                    tight = spans[spans.status != "ok"]
+                    line = (f"Box check (before docking): box {bx['size'][0]:.1f} x {bx['size'][1]:.1f} x "
+                            f"{bx['size'][2]:.1f} A ({bx['volume']:,} A^3); longest ligand "
+                            f"{spans.span.max():.1f} A, smallest box side {min(bx['size']):.1f} A. ")
+                    line += ("May be limited: " + ", ".join(f"{r.name} {r.span:.1f} A ({r.status})" for r in tight.itertuples())
+                             + f" - consider autobox_add >= {sugg:g} A." if len(tight) else "All ligands fit with >= 2 A to spare.")
+                    print(("⚠ " if len(tight) else "✔ ") + line)
+                    logf.write("# " + line + "\n")
+                if bad_records:
+                    i = bad_records[0]
+                    print(f"⚠ Ligand file: record {i + 1} ('{input_titles[i]}') cannot be read"
+                          f"{f' (and {len(bad_records) - 1} more)' if len(bad_records) > 1 else ''}. smina stops "
+                          f"reading the file at an unreadable record and SKIPS ALL LATER LIGANDS without an error "
+                          f"- fix or remove it. Coverage is checked after the run.")
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                         text=True, bufsize=1)
                 for line in proc.stdout:
@@ -1260,9 +1925,45 @@ class SminaPanel:
                     if line.strip() and not line.startswith(("*", "-----", "mode |")):
                         print(line, end="")
                 rc = proc.wait()
-                print(f"\nsmina finished with exit code {rc}. Output: {out}\nLog: {log_path}")
+                info["exit_code"] = rc
+                info["finished"] = _now()
+                info["output"] = {"path": str(out), "sha256": file_sha256(out) if out.exists() else None}
+                if self.flexible and self.flex_output.exists():
+                    info["output_flexres"] = {"path": str(self.flex_output),
+                                              "sha256": file_sha256(self.flex_output)}
+                import json
+                info_path.write_text(json.dumps(info, indent=2))
+                print(f"\nsmina finished with exit code {rc}. Output: {out}\nLog: {log_path}\n"
+                      f"Run record: {info_path}")
                 if self.flexible:
                     print(f"Flexible side chains (one model per pose): {self.flex_output}")
+                if rc == 0 and out.exists() and input_titles is not None:
+                    docked_names = set(sdf_titles(out))
+                    wanted = list(dict.fromkeys(t for t in input_titles if t))
+                    missing = [n for n in wanted if n not in docked_names]
+                    info["ligands_in"] = len(wanted)
+                    info["ligands_docked"] = len(wanted) - len(missing)
+                    info["ligands_missing"] = missing
+                    info_path.write_text(json.dumps(info, indent=2))
+                    if missing:
+                        print(f"\n⚠ COVERAGE: smina produced no poses for {len(missing)} of {len(wanted)} ligands: "
+                              f"{', '.join(missing[:15])}{' ...' if len(missing) > 15 else ''}. "
+                              f"smina exits normally when it skips ligands or stops at an unreadable record - "
+                              f"check the ligand file and the log.")
+                    else:
+                        print(f"\n✔ Coverage: all {len(wanted)} ligands have poses.")
+                if rc == 0 and info.get("box") and out.exists():
+                    poses = load_poses(out)
+                    margins = box_margins(poses, info["box"])
+                    edge = [(m.GetProp("_Name"), g) for m, g in zip(poses, margins) if g < BOX_EDGE_MARGIN]
+                    if edge:
+                        names = sorted({n for n, _ in edge})
+                        print(f"\n⚠ Box check: {len(edge)} of {len(poses)} poses have a heavy atom within "
+                              f"{BOX_EDGE_MARGIN:g} Å of the box edge ({sum(g < 0 for _, g in edge)} outside it); "
+                              f"ligands: {', '.join(names)}. The box may be limiting these ligands - "
+                              f"consider a larger autobox_add.")
+                    else:
+                        print(f"\n✔ Box check: no pose within {BOX_EDGE_MARGIN:g} Å of the box edge.")
             if rc == 0:
                 self.last_output = out
             return rc
@@ -1294,19 +1995,88 @@ def _pose_index(pose_id):
     return int(str(pose_id).rsplit("_", 1)[1])
 
 
-def pose_flex_models(poses, flex_pdb):
-    """Map pose_id -> flexible-residue model, checking counts and names."""
+def sdf_titles(path):
+    """Title (first line) of every record in an SDF, readable or not, in file order."""
+    titles, first = [], True
+    with open(path) as f:
+        for line in f:
+            if first:
+                titles.append(line.strip())
+                first = False
+            if line.startswith("$$$$"):
+                first = True
+    return titles
+
+
+FLEX_CLASH = 1.5  # Å: a pose this close to its own flexed side chains cannot be a correct pairing
+
+
+def pose_flex_models(poses, flex_pdb, docked_sdf=None, strict=True):
+    """Map pose_id -> flexible-residue model (smina --out_flex).
+
+    smina writes a ligand's poses and its side-chain models together, so the
+    two files are normally in step. This is verified, not assumed:
+    1. if the record titles of the docked SDF and the model names (COMPND)
+       are identical, poses and models are paired by position;
+    2. otherwise the two name sequences are aligned and only poses whose
+       name matches are paired; the rest get no flexed receptor;
+    3. every pair is checked geometrically - a pose overlapping its own
+       flexed side chains (< 1.5 Å) is not a valid pairing.
+    With strict=True an unresolved mismatch or a clash raises an error."""
+    import difflib
     models = load_flex_models(flex_pdb)
-    n_poses = max(_pose_index(m.GetProp("pose_id")) for m in poses) + 1
-    if len(models) != n_poses:
-        print(f"Warning: {len(models)} flexible-residue models for {n_poses} poses in {flex_pdb}")
-    out = {}
-    for m in poses:
-        i = _pose_index(m.GetProp("pose_id"))
-        if i < len(models):
-            if models[i]["name"] and models[i]["name"] != m.GetProp("_Name"):
-                print(f"Warning: model {i} is for '{models[i]['name']}' but pose is '{m.GetProp('_Name')}'")
-            out[m.GetProp("pose_id")] = models[i]["block"]
+    model_names = [m["name"] for m in models]
+    by_index = {_pose_index(m.GetProp("pose_id")): m for m in poses}
+    titles = sdf_titles(docked_sdf) if docked_sdf else [by_index[i].GetProp("_Name") if i in by_index else ""
+                                                          for i in range(max(by_index) + 1)]
+    if titles == model_names:
+        pairs = {i: i for i in range(len(titles))}
+    else:
+        # align runs of consecutive same-name records (one run per ligand/conformer block);
+        # a block is paired only if it has as many poses as models - otherwise positions
+        # inside it cannot be trusted and the whole block is left unpaired
+        def runs(names):
+            out, start = [], 0
+            for k in range(1, len(names) + 1):
+                if k == len(names) or names[k] != names[start]:
+                    out.append((names[start], start, k - start))
+                    start = k
+            return out
+        ra, rb = runs(titles), runs(model_names)
+        sm = difflib.SequenceMatcher(a=[r[0] for r in ra], b=[r[0] for r in rb], autojunk=False)
+        pairs = {}
+        for tag, a0, a1, b0, b1 in sm.get_opcodes():
+            if tag == "equal":
+                for (na, sa, ca), (nb, sb, cb) in zip(ra[a0:a1], rb[b0:b1]):
+                    if ca == cb:
+                        pairs.update({sa + k: sb + k for k in range(ca)})
+        unpaired = [titles[i] for i in range(len(titles)) if i not in pairs]
+        msg = (f"{len(titles)} poses but {len(models)} flexible-residue models in {Path(flex_pdb).name}; "
+               f"{len(pairs)} paired by name, {len(unpaired)} without a flexed receptor "
+               f"({', '.join(sorted(set(unpaired))) or '-'})")
+        if strict and (unpaired or len(pairs) != len(models)):
+            raise ValueError("Poses and flexible-residue models do not correspond: " + msg)
+        print("Warning: " + msg)
+    out, clashes = {}, []
+    for i, j in pairs.items():
+        m = by_index.get(i)
+        if m is None:
+            continue
+        block = models[j]["block"]
+        flex_xyz = np.array([[float(l[30:38]), float(l[38:46]), float(l[46:54])]
+                             for l in block.splitlines()
+                             if l.startswith(("ATOM", "HETATM")) and not _is_h(_pdb_element(l))])
+        lig = m.GetConformer().GetPositions()[[a.GetAtomicNum() > 1 for a in m.GetAtoms()]]
+        if len(flex_xyz) and np.linalg.norm(lig[:, None] - flex_xyz[None], axis=-1).min() < FLEX_CLASH:
+            clashes.append(m.GetProp("pose_id"))
+            continue
+        out[m.GetProp("pose_id")] = block
+    if clashes:
+        msg = (f"{len(clashes)} pose(s) overlap their own flexed side chains (< {FLEX_CLASH:g} Å) - "
+               f"pairing not valid: {', '.join(clashes[:10])}{' ...' if len(clashes) > 10 else ''}")
+        if strict:
+            raise ValueError(msg)
+        print("Warning: " + msg)
     return out
 
 
@@ -1338,7 +2108,7 @@ def results_browser(poses, protein_pdb, reference_ligand=None, predictions=None,
     ref_block = Path(reference_ligand).read_text() if reference_ligand else None
     ref_fmt = Path(reference_ligand).suffix.lstrip(".").lower() if reference_ligand else None
     ref_fmt = "sdf" if ref_fmt in ("sdf", "mol") else "pdb"
-    flex_models = pose_flex_models(poses, flex_pdb) if flex_pdb and Path(flex_pdb).exists() else {}
+    flex_models = pose_flex_models(poses, flex_pdb, strict=False) if flex_pdb and Path(flex_pdb).exists() else {}
     prot_atoms = _protein_heavy_atoms(protein_block)
 
     slider, nav = _nav_slider(len(table), "Pose")
@@ -1359,6 +2129,9 @@ def results_browser(poses, protein_pdb, reference_ligand=None, predictions=None,
                 info += f" &nbsp; AEV-PLIG pK: <b>{row['AEV_PLIG_pK']:.2f}</b>"
             flex_res = []
             prot = protein_block
+            if flex_models and row["pose_id"] not in flex_models:
+                info += ("<br><span style='color:#b00'>No verified flexed receptor for this pose - "
+                         "shown with the rigid protein.</span>")
             if row["pose_id"] in flex_models:
                 prot, flexed, unmatched = build_flexed_receptor(protein_block, flex_models[row["pose_id"]])
                 flex_res = [(c, r) for _, c, r in flexed]
@@ -1629,6 +2402,20 @@ def export_pymol_session(docked_sdf, protein_pdb, reference_ligand=None, out_pat
     return out_path
 
 
+# 2.303 RT at 298.15 K (kcal/mol): converts pK to binding free energy, dG = -1.364 * pK
+RT_LN10 = 0.0019872 * 298.15 * np.log(10)
+
+
+def add_ligand_efficiency(df):
+    """Add ligand efficiency columns (kcal/mol per heavy atom) to a table with
+    heavy_atoms, AEV_PLIG_pK and minimizedAffinity columns:
+      LE_AEV_PLIG = 1.364 * pK / heavy_atoms   (from the predicted affinity)
+      LE_smina    = -minimizedAffinity / heavy_atoms"""
+    df["LE_AEV_PLIG"] = RT_LN10 * df["AEV_PLIG_pK"] / df["heavy_atoms"]
+    df["LE_smina"] = -df["minimizedAffinity"] / df["heavy_atoms"]
+    return df
+
+
 def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None,
                  python=sys.executable, extra_files=(), add_hydrogens=True, flex_pdb=None,
                  reference_mol=None, reference_smina=None):
@@ -1654,7 +2441,8 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
     Everything is exported to <folder of docked_sdf>/predictions/:
       poses/<stem>/pose_<i>.sdf, <stem>_aevplig_input.csv, <stem>_predictions.csv (raw),
       <stem>_summary.csv, <stem>_scored.sdf, <stem>_best_poses.sdf,
-      <stem>_best_poses_table.csv, <stem>_smina_vs_aevplig.png, best_poses_pdb/<stem>/ (best pose per ligand as
+      <stem>_best_poses_table.csv, <stem>_run_info.json (docking + scoring settings,
+      versions and input checksums), <stem>_smina_vs_aevplig.png, best_poses_pdb/<stem>/ (best pose per ligand as
       ligand-only and protein-ligand complex PDB files) and copies of the
       inputs in extra_files.
     """
@@ -1670,7 +2458,7 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
     flex_models = {}
     if flex_pdb:
         flex_pdb = Path(flex_pdb).resolve()
-        flex_models = pose_flex_models(poses, flex_pdb)
+        flex_models = pose_flex_models(poses, flex_pdb, docked_sdf=docked_sdf)
         protein_text = protein_pdb.read_text()
         print(f"Flexible docking: building a receptor with flexed side chains for each pose")
     rows = []
@@ -1680,6 +2468,8 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
         with Chem.SDWriter(str(f)) as w:
             w.write(Chem.AddHs(m, addCoords=True) if add_hydrogens else m)
         receptor = protein_pdb
+        if flex_models and pid not in flex_models:
+            continue  # flexible run but no verified flexed receptor for this pose: do not score it
         if pid in flex_models:
             text, _, unmatched = build_flexed_receptor(protein_text, flex_models[pid])
             if unmatched:
@@ -1728,6 +2518,22 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
         columns={"unique_id": "pose_id", "preds": "AEV_PLIG_pK"})
     preds["AEV_PLIG_pK_std"] = raw[model_cols].std(axis=1).values
     summary = summary.merge(preds, on="pose_id", how="left")
+    heavy = {m.GetProp("pose_id"): m.GetNumHeavyAtoms() for m in poses}
+    if reference_mol is not None:
+        heavy["pdb_ligand"] = reference_mol.GetNumHeavyAtoms()
+    summary["heavy_atoms"] = summary.pose_id.map(heavy)
+    summary = add_ligand_efficiency(summary)
+    import json as _json
+    _rec = docked_sdf.with_name(stem + ".run.json")
+    _box = box_from_run_record(_json.loads(_rec.read_text())) if _rec.exists() else None
+    if _box:
+        _margin = dict(zip([m.GetProp("pose_id") for m in poses], box_margins(poses, _box)))
+        if reference_mol is not None:
+            _margin["pdb_ligand"] = box_margins([reference_mol], _box)[0]
+        summary["box_margin"] = summary.pose_id.map(_margin)
+        summary["at_box_edge"] = summary.box_margin < BOX_EDGE_MARGIN
+    else:
+        summary["box_margin"], summary["at_box_edge"] = np.nan, pd.NA
     reference = summary[summary.pose_id == "pdb_ligand"]
     summary = summary[summary.pose_id != "pdb_ligand"].reset_index(drop=True)
     dropped = summary["AEV_PLIG_pK"].isna().sum()
@@ -1737,12 +2543,14 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
     summary["best_aevplig_for_ligand"] = summary.groupby("name")["AEV_PLIG_pK"].transform("max") == summary["AEV_PLIG_pK"]
     summary = summary.sort_values("AEV_PLIG_pK", ascending=False).reset_index(drop=True)
     summary_cols = ["pose_id", "name", "minimizedAffinity", "AEV_PLIG_pK", "AEV_PLIG_pK_std",
+                    "heavy_atoms", "LE_AEV_PLIG", "LE_smina", "box_margin", "at_box_edge",
                     "best_smina_for_ligand", "best_aevplig_for_ligand", "receptor_file"] + model_cols
     summary = summary[summary_cols]
     summary.to_csv(pred_dir / f"{stem}_summary.csv", index=False)
 
     # Best pose per ligand + the ligand from the PDB (crystal pose)
-    table_cols = ["name", "pose_id", "minimizedAffinity", "AEV_PLIG_pK", "AEV_PLIG_pK_std"]
+    table_cols = ["name", "pose_id", "minimizedAffinity", "AEV_PLIG_pK", "AEV_PLIG_pK_std",
+                  "heavy_atoms", "LE_AEV_PLIG", "LE_smina", "box_margin", "at_box_edge"]
     best_table = summary[summary.best_aevplig_for_ligand][table_cols].copy()
     best_table.insert(0, "source", "docked (best AEV-PLIG pose)")
     ref_pk = None
@@ -1752,6 +2560,7 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
         ref.insert(0, "source", "ligand from PDB")
         if reference_smina:
             ref["minimizedAffinity"] = reference_smina.get("minimizedAffinity", np.nan)
+            ref["LE_smina"] = -ref["minimizedAffinity"] / ref["heavy_atoms"]
             ref["smina_score_only"] = reference_smina.get("score_only", np.nan)
             ref["minimizedRMSD"] = reference_smina.get("minimizedRMSD", np.nan)
         best_table = pd.concat([best_table, ref], ignore_index=True)
@@ -1763,6 +2572,32 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
             print(f"PDB ligand {ref_name}: AEV-PLIG pK {ref_pk:.2f} "
                   f"+/- {reference['AEV_PLIG_pK_std'].iloc[0]:.2f}")
     best_table.to_csv(pred_dir / f"{stem}_best_poses_table.csv", index=False)
+    if _box:
+        edge_best = summary[summary.best_aevplig_for_ligand & summary.at_box_edge.astype(bool)]
+        if len(edge_best):
+            print(f"⚠ Box check: best pose at the box edge for {', '.join(edge_best.name)} "
+                  f"(margin < {BOX_EDGE_MARGIN:g} Å) - these ligands may be limited by the search box.")
+
+    # Run record: docking settings (from smina's .run.json) + AEV-PLIG settings
+    import json
+    docking_info_path = docked_sdf.with_name(stem + ".run.json")
+    run_info = {
+        "created": _now(),
+        "docked_sdf": {"path": str(docked_sdf), "sha256": file_sha256(docked_sdf)},
+        "docking": json.loads(docking_info_path.read_text()) if docking_info_path.exists() else None,
+        "aev_plig": {"model": AEV_PLIG_MODEL, "ensemble_size": len(model_cols),
+                     "hydrogens_added": add_hydrogens, "flexible_receptors": bool(flex_models),
+                     "receptor": {"path": str(protein_pdb), "sha256": file_sha256(protein_pdb)},
+                     "poses_scored": int(summary["AEV_PLIG_pK"].notna().sum()),
+                     "poses_rejected": int(dropped)},
+        "reference_ligand": None if not len(reference) else {
+            "name": ref_name, "AEV_PLIG_pK": None if ref_pk is None else round(float(ref_pk), 4),
+            "smina": reference_smina},
+        "software": software_versions(),
+    }
+    if run_info["docking"] is None:
+        print(f"Note: no docking run record ({docking_info_path.name}) found; settings not recorded")
+    (pred_dir / f"{stem}_run_info.json").write_text(json.dumps(run_info, indent=2, default=str))
 
     # Annotated SDFs
     lookup = summary.set_index("pose_id")
@@ -1800,7 +2635,7 @@ def run_aev_plig(docked_sdf, protein_pdb, predictions_dir=None, num_workers=None
     fig.savefig(pred_dir / f"{stem}_smina_vs_aevplig.png", dpi=150)
     plt.show()
 
-    for f in [docked_sdf, protein_pdb, flex_pdb, *extra_files]:
+    for f in [docked_sdf, docked_sdf.with_name(stem + ".run.json"), protein_pdb, flex_pdb, *extra_files]:
         if f and Path(f).exists() and Path(f).resolve().parent != pred_dir:
             shutil.copy2(f, pred_dir / Path(f).name)
     print(f"All results exported to {pred_dir}")

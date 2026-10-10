@@ -2,11 +2,12 @@
 
 A Jupyter notebook for docking ligands into a protein with **smina** and rescoring the poses with the **AEV-PLIG** binding-affinity model. It covers conformer generation, binding-site preparation, rigid or flexible docking, pose viewing, affinity prediction and export.
 
-The example is the SARS-CoV-2 main protease (Mpro) fragment structure **5RHD**. A fully run copy of the notebook is in [`DockingScoring.html`](DockingScoring.html) (download it and open it in a browser to see the outputs and 3D views).
+The example is the SARS-CoV-2 main protease (Mpro) fragment structure **5RHD**. A fully run copy of the notebook is in [`DockingScoring.html`](DockingScoring.html) (download it and open it in a browser to see the outputs and interactive 3D views) and, for printing or quick viewing on GitHub, [`DockingScoring.pdf`](DockingScoring.pdf).
 
 ## Workflow
 
 1. **Ligands.** Load an SDF of 3D structures, check that the names are unique, and browse the molecules with a slider.
+1b. **Ionisation states.** Optionally predict each ligand's ionisation state at a chosen pH with QupKake (micro-pKa prediction), and dock the ligands in those states.
 2. **Conformers.** Generate conformers with RDKit srETKDGv3 (or ETKDGv3, ETKDG, ETDG), pruned by RMSD, MMFF94-minimised and filtered by an energy window. Undefined stereocentres can optionally be enumerated.
 3. **Binding site.** Either:
    - load a **protein–ligand complex PDB** and pick the ligand that defines the site, or
@@ -42,6 +43,7 @@ conda run -n docking_scoring python -m ipykernel install --user --name docking_s
 | torchani | 2.9 |
 | PyMOL (open source) | 3.1 |
 | Open Babel | 3.2 |
+| gemmi | 0.7 |
 | py3Dmol | 2.5 |
 | ipywidgets | 8.1 |
 | JupyterLab | 4.6 |
@@ -91,6 +93,7 @@ Open `DockingScoring.ipynb` in JupyterLab with the **Python (docking_scoring)** 
 ```
 DockingScoring.ipynb         the notebook
 DockingScoring.html          a fully run copy of the notebook (static)
+DockingScoring.pdf           the same, as a PDF (A4 landscape)
 docking_tools.py             all helper code (panels, viewers, docking, scoring, export)
 environment.yml              conda environment (portable)
 docking_scoring.yml          exact tested environment (macOS arm64)
@@ -117,14 +120,21 @@ The original name is kept in the `original_name` property, and the input file is
 
 ### Binding site
 
-**Complex PDB mode**
+**Complex structure mode** (PDB or mmCIF)
 
-- Lists every HET group (waters excluded) and pre-selects the largest; choose another if the file contains several ligands.
-- Bond orders for the extracted ligand come from:
-  - its hydrogens and formal charges (RDKit), when hydrogens are present;
-  - a SMILES template, if you paste one;
-  - Open Babel, when there are no hydrogens.
+- Reads `.pdb` and mmCIF (`.cif`, `.mmcif`, optionally gzipped). mmCIF is the PDB's standard format, and is read with [gemmi](https://gemmi.readthedocs.io).
+- **Lists all ligands**, with chemical names where the file has them, and **selects the largest automatically**. The panel says which one was chosen; pick another from the list if the file holds several ligands.
+- Hides waters, solvents and crystallisation additives (e.g. DMSO, glycerol, PEG, sulfate), ions, and terminal caps such as NME. Tick *Also list solvents, ions, additives and caps* to show them.
+- Uses only the first alternate location (A) of the protein and ligand.
+- Bond orders for the extracted ligand come from, in order of preference:
+  1. a SMILES template, if you paste one. Its charges are kept, so it can set the protonation state;
+  2. the ligand's hydrogens and formal charges (RDKit), when hydrogens are present;
+  3. the ligand's entry in the PDB Chemical Component Dictionary, fetched from RCSB, for files without hydrogens such as RCSB X-ray structures. It is used only if its heavy atoms match, and gives the neutral molecule;
+  4. Open Babel perception from the geometry.
 - The protein file keeps the HELIX and SHEET records, but other HET groups and waters are removed. Metal ions are kept unless you untick that option.
+- Output files are named after the input, e.g. `5RHD_protein.pdb`. mmCIF input adds `_cif` (`5RHD_cif_protein.pdb`), so it never overwrites files made from a PDB file of the same entry, which may use a different coordinate frame.
+
+> **Example:** `example/5RHD.pdb` was prepared in MOE (hydrogens added, piperazine protonated, ligand named `LIG`). `example/5RHD.cif` is the RCSB file: its ligand `US7` has no hydrogens and is taken as the neutral molecule. Paste `CS(=O)(=O)c1ccc(N2CC[NH2+]CC2)cc1` as the SMILES template for the protonated form. Using the CIF gave the same best-pose AEV-PLIG pK for FromXRay (5.31) as the PDB file.
 
 **Prepared-files mode** uses your protein and ligand PDB files as they are.
 
@@ -138,18 +148,20 @@ Every output is written next to the input it was derived from.
 
 | File | Location |
 |---|---|
+| `<input>_pH7.4.sdf` / `.csv` (ligands in QupKake-predicted ionisation states) and `qupkake/` | next to the ligand SDF |
 | `<input>_confs.sdf` | next to the ligand SDF |
 | `<stem>_protein.pdb`, `<stem>_ligand_<RES><chain><num>.pdb/.sdf` | next to the complex PDB |
 | `<stem>_complex.png`, `<stem>_site.png` | next to the binding-site input |
-| `<input>_docked.sdf` / `_flexdocked.sdf` / `_minimized.sdf`, plus `.log` | next to the ligand SDF |
+| `<input>_docked.sdf` / `_flexdocked.sdf` / `_minimized.sdf`, plus `.log` and `.run.json` (run record) | next to the ligand SDF |
 | `<output>_flexres.pdb` (flexible docking: one model per pose) | next to the docked SDF |
 
 All prediction results go to a `predictions/` folder next to the docked SDF:
 
 | File | Contents |
 |---|---|
-| `<docked>_summary.csv` | every pose: smina score, AEV-PLIG pK (10-model mean ± std), best-pose flags |
-| `<docked>_best_poses_table.csv` | best pose per ligand, plus the PDB ligand row (AEV-PLIG pK and smina scores) |
+| `<docked>_summary.csv` | every pose: smina score, AEV-PLIG pK (10-model mean ± std), heavy atoms, ligand efficiency, box margin, best-pose flags |
+| `<docked>_run_info.json` | run record: docking and scoring settings, software versions, input checksums |
+| `<docked>_best_poses_table.csv` | best pose per ligand, plus the PDB ligand row (AEV-PLIG pK, smina scores, ligand efficiency, box margin) |
 | `<docked>_scored.sdf`, `<docked>_best_poses.sdf` | poses annotated with pK |
 | `best_poses_pdb/<docked>/` | best pose per ligand as `_ligand.pdb` and `_complex.pdb` (ligand = chain L, resname LIG) |
 | `<docked>_best_poses.pse` | PyMOL session of the best poses |
@@ -159,6 +171,94 @@ All prediction results go to a `predictions/` folder next to the docked SDF:
 | `<docked>_aevplig_input.csv`, `<docked>_predictions.csv`, logs | raw AEV-PLIG input and output |
 
 Copies of the docked SDF, receptor, reference ligand, conformers and images are also placed in `predictions/`, so the folder is a self-contained record.
+
+## Search box
+
+smina docks only inside the search box: the extent of the autobox ligand (all atoms, hydrogens included) plus `autobox_add` (default 4 Å) on every side. Atoms outside the box are heavily penalised during the search, and smina gives **no warning** when a ligand is too large. The ligand is simply squeezed: it curls up, or groups that would reach a neighbouring sub-pocket point elsewhere.
+
+**Before docking**, the smina panel shows the box size and compares each ligand's longest heavy-atom span, taken from the conformer file, with the smallest box side:
+
+| Status | Meaning |
+|---|---|
+| ok | at least 2 Å to spare |
+| *tight* | less than 2 Å to spare |
+| *longer than smallest box side* | the ligand can only fit along a diagonal |
+
+When any ligand is tight or longer, the panel suggests an `autobox_add`. It also warns above Vina's recommended 27,000 Å³.
+
+**After docking**, smina's output reports how many poses have a heavy atom within 1 Å of a box face. The summary and best-poses tables add `box_margin`, the closest heavy-atom distance to a face in Å (negative means outside), and `at_box_edge`. A **best pose at the box edge** means the box may have limited that ligand: re-dock with a larger `autobox_add`, or set the box explicitly with `--center_x/y/z --size_x/y/z` under "extra arguments".
+
+Example (5RHD fragment + 4 Å = 16.8 × 13.2 × 15.5 Å):
+
+- Phenyl (11.4 Å) and iProAmine (11.9 Å) are *tight*.
+- 38 of 297 poses come within 1 Å of the edge, and 3 have an atom slightly outside.
+- iProAmine's best AEV-PLIG pose is 0.13 Å outside the box.
+
+The box is stored in each run record (`<output>.run.json`).
+
+## Ligand efficiency
+
+The summary and best-poses tables include ligand efficiency (LE), the binding free energy per heavy atom, in kcal/mol per heavy atom:
+
+| Column | Definition |
+|---|---|
+| `heavy_atoms` | number of non-hydrogen atoms |
+| `LE_AEV_PLIG` | 1.364 × pK / heavy atoms, from the AEV-PLIG pK (ΔG = −2.303 RT pK at 298 K) |
+| `LE_smina` | −(smina score) / heavy atoms |
+
+An LE of about 0.3 or more is the usual guide for a good starting point. Small fragments such as the 5RHD series (15–21 heavy atoms) typically score 0.4–0.5 on `LE_AEV_PLIG`.
+
+> **Note:** After flexible docking, `LE_smina` is inflated, because the flexible smina score appears to include the flexed side chains. Use `LE_AEV_PLIG` to compare across docking modes.
+
+## Ionisation states (QupKake)
+
+[QupKake](https://github.com/Shualdon/QupKake) (Abarbanel & Hutchison, *J. Chem. Theory Comput.* 2024, https://doi.org/10.1021/acs.jctc.4c00328) predicts micro-pKa values from GFN2-xTB calculations and graph neural networks. Step 1b of the notebook uses it to set the ionisation state of the input ligands and of the ligand from the PDB.
+
+**How the state is set:**
+
+1. Each ligand is neutralised and submitted to QupKake, which predicts a pKa for every basic and acidic site.
+2. At the chosen pH (default 7.4), the **most basic site is protonated** if its pKa is above the pH, and the **most acidic site is deprotonated** if its pKa is below it. At most one of each is applied. Other sites that also cross the pH are reported, not applied.
+3. **Implausible basic sites are ignored** (on by default; untick the box to use every site). For this ligand series QupKake reported sulphonamide N, amide N and aryl-amine N, such as the N-aryl nitrogen of an aryl-piperazine, as the most basic sites. Taken at face value, that would protonate a sulphonamide (`[NH3+]S(=O)(=O)…`).
+
+The ligands in their predicted states are written to `<input>_pH7.4.sdf`, with a table in `<input>_pH7.4.csv`. When docking in the predicted states is ticked, that file is docked, so every later output is named `<input>_pH7.4_…` and never overwrites the results for the input states. The PDB ligand keeps its crystal coordinates and is used as the reference in the final table. QupKake's own files are in `qupkake/` next to the input.
+
+**Example result (pH 7.4).** With the filter on, QupKake's states match the MOE-prepared input exactly: the piperazine or piperidine NH is protonated, or the N-isopropyl N for iProAmine. Re-docking therefore reproduced all 297 poses and scores. The neutral US7 from `5RHD.cif` is protonated to the same state.
+
+With the filter off, 6 of the 7 ligands were charged on a sulphonamide or aryl-amine N, and the best-pose AEV-PLIG pK changed by −0.27 to +0.35:
+
+| Ligand | pK, input / QupKake (filtered) | pK, QupKake raw | Raw protonation site |
+|---|---|---|---|
+| iProAmine | 6.87 | 6.77 | sulphonamide NH₂ |
+| sulphonamide | 6.57 | 6.46 | sulphonamide NH₂ |
+| Phenyl | 5.67 | 5.47 | aryl N |
+| piperidine | 5.45 | 5.45 | piperidine NH (same) |
+| FromXRay | 5.31 | 5.04 | aryl N |
+| DimethylN | 5.22 | 5.57 | sulphonamide N(CH₃)₂ |
+| amide | 4.67 | 4.40 | aryl N |
+
+**Installing QupKake.** It needs its own conda environment, named `qupkake`, with xtb 6.4.1 built from source; see the [QupKake README](https://github.com/Shualdon/QupKake). On Apple silicon, build xtb at `-O2`, because gfortran 16 at `-O3` miscompiles it. The notebook finds the environment automatically and limits each xtb process to one thread. If QupKake is not installed, the input ionisation states are used.
+
+## Reproducibility
+
+Every smina run writes a run record next to its output, `<output>.run.json`, and the same summary at the top of `<output>.log`. The record holds:
+
+- the smina version and path, and the full command;
+- seed, `--cpu`, exhaustiveness and every other setting;
+- the platform;
+- SHA-256 checksums of the receptor, ligand and autobox files and of the output.
+
+AEV-PLIG adds `predictions/<docked>_run_info.json`, which contains that docking record plus the model, scoring options, library versions, receptor checksum and the PDB-ligand scores.
+
+**Seed and thread count.** With the tested smina build (`master:dc3dfab`, based on AutoDock Vina 1.1.2), a fixed `--seed` gave identical poses whatever the `--cpu` value:
+
+| Mode | `--cpu` values compared | Coordinates | Reported scores |
+|---|---|---|---|
+| Rigid | 1, 4, 8, 24 | identical | identical |
+| Flexible | 1, 3, 24 | identical | identical at `--cpu` 1 and 24 |
+
+At `--cpu 3` (fewer threads than exhaustiveness runs), flexible docking showed a run-to-run jitter of up to 0.002 kcal/mol in the reported score. That is below the 0.01 kcal/mol precision of smina's log.
+
+`--cpu` therefore defaults to the number of cores. Results can still differ with a different smina or Vina build, platform or compiler, so keep the run record with your results.
 
 ## Flexible docking
 
@@ -179,6 +279,13 @@ smina writes the flexed side chains for every pose. They come out in the same or
 - in the 3D viewer, where the flexed side chains are magenta and the original ones grey;
 - by AEV-PLIG, which scores each pose against its own receptor;
 - in the PDB and PyMOL exports.
+
+**Pairing poses with their side chains is verified, not assumed.** smina writes each ligand's poses and side-chain models together, so if it skips a ligand both files lose it and stay in step (tested). Before anything is paired, the notebook checks:
+
+- Names: the docked SDF's record titles and the models' names must match. If they don't, ligand blocks are aligned by name, and a block is paired only when its pose and model counts agree.
+- Geometry: a pose that overlaps its own flexed side chains (< 1.5 Å) is rejected.
+
+AEV-PLIG stops with an error on any mismatch, rather than score a pose against the wrong receptor. The viewer shows such poses with the rigid protein and a warning.
 
 > **Note:** The flexible-docking smina score appears to include the flexed side chains, so its values (around −8 to −11 kcal/mol for the example) are not comparable with rigid scores or with the PDB-ligand row. AEV-PLIG pK values are comparable between modes.
 
@@ -214,6 +321,8 @@ Valsson *et al.*, "Narrowing the gap between machine learning scoring functions 
 - **Binding-site image** has a toggle to hide the side chains.
 
 ## Known limitations
+
+- **smina silently stops at an unreadable SDF record.** Every later ligand is skipped, the exit code is still 0, and the log says nothing. The smina panel warns before docking if the ligand file has unreadable records. After docking it compares the input ligands with the docked ones, reports any ligand with no poses, and records them in the run record (`ligands_missing`).
 
 - Running the notebook from the command line with `jupyter nbconvert --execute` stalls on the slider cells; this is an nbclient issue. All the steps still complete and their files are written. Use JupyterLab interactively.
 - Turns are coloured as coil unless the PDB file has TURN records, because neither 3Dmol.js nor PyMOL assigns turns.

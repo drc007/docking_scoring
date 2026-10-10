@@ -19,6 +19,7 @@ dependencies:
   - qcelemental
   - pymol-open-source
   - openbabel
+  - gemmi                 # mmCIF reading
   - py3dmol
   - ipywidgets
   - jupyterlab
